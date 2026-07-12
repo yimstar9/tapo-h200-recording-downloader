@@ -201,6 +201,36 @@ Web UI는 저장된 MP4 재생, 누락된 클립 다운로드, 현재 접속한 
 
 주의: Web UI에는 자체 인증이 없습니다. 신뢰하는 LAN/VPN에서만 바인딩하고 공용 인터넷에 직접 노출하지 마세요.
 
+### Android / Termux에서 실행
+
+갤럭시에서는 Termux에 Ubuntu를 추가로 설치하지 않고 Python을 직접 실행하는 구성을 권장합니다. Termux 홈 디렉터리에 저장소를 받은 뒤 환경을 준비합니다.
+
+```bash
+pkg update
+pkg install git python
+git clone https://github.com/yimstar9/tapo-h200-recording-downloader.git
+cd tapo-h200-recording-downloader
+python -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
+`.env`와 로컬 인증 파일을 휴대폰에서 새로 만들려면 H200과 같은 Wi-Fi에 연결한 뒤 실행합니다.
+
+```bash
+.venv/bin/python h200_recordings.py --setup
+```
+
+Termux 전용 관리 스크립트는 서버 실행 중 CPU가 잠들지 않도록 wake lock을 사용하고 PID와 로그를 프로젝트 폴더에 저장합니다.
+
+```bash
+./termux_h200_web start
+./termux_h200_web status
+./termux_h200_web stop
+H200_WEB_PORT=8093 ./termux_h200_web restart
+```
+
+휴대폰에서는 `http://127.0.0.1:8092`, 같은 Wi-Fi의 다른 기기에서는 `http://PHONE_IP:8092`로 접속합니다. Android 설정에서 Termux의 배터리 사용을 `제한 없음`으로 지정하고 절전 앱 대상에서 제외하세요.
+
 ## 향후 스트리밍 연동 참고
 
 스트리밍 기능은 아직 이 프로젝트에 구현되어 있지 않습니다. 나중에 go2rtc 같은 도구와 연동할 때는 H200 IP, D230 `device_id`, 그리고 H200/camera password의 SHA256 hash가 필요할 수 있습니다.

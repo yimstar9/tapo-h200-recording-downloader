@@ -1,0 +1,34 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local Tapo credentials and keys
+tapo_h200.local.json
+tapo_h200.local.key
+tapo*.json
+tapo*.key
+.env
+.env.*
+!.env.example
+
+# Runtime files
+*.log
+*.pid
+h200_web.log
+h200_web.pid
+
+# Downloaded recordings and temporary media
+recordings/
+h200_recordings/
+h200_recordings_mp4/
+*.download.ts
+*.mp4
+
+# Network captures may contain private traffic
+*.pcap
+*.pcapng
+
+# OS/editor noise
+.DS_Store

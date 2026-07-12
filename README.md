@@ -77,6 +77,18 @@ Tapo cloud password:
   첫 번째 입력값과 같으면 그냥 Enter
 ```
 
+비밀번호가 맞는지만 확인하려면 아래 스크립트를 사용합니다. 입력한 비밀번호는 설정 파일에 저장하지 않습니다.
+
+```bash
+.venv/bin/python check_h200_password.py
+```
+
+다른 H200을 확인할 때는 IP를 직접 지정할 수 있습니다.
+
+```bash
+.venv/bin/python check_h200_password.py --host H200_IP
+```
+
 ## D230 deviceId 자동 저장
 
 일반적으로는 `--setup` 한 번이면 D230 `device_id`가 `.env`에 자동 저장됩니다.

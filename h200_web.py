@@ -178,6 +178,7 @@ def run_download_job(job_id: str, date: str, skip_existing: bool) -> None:
         update(status="running", message="Connecting to H200...")
         creds, hub, camera = get_hub_and_camera()
         clips = h200.list_recordings(hub, camera, date, date)
+        camera_client = h200.connect_camera(creds, camera)
         update(total=len(clips), downloaded=0, skipped=0, failed=0)
         for idx, clip in enumerate(clips):
             start_time = int(clip["startTime"])
@@ -194,9 +195,7 @@ def run_download_job(job_id: str, date: str, skip_existing: bool) -> None:
             update(current=idx + 1, message=f"Downloading {output.name}")
             ok = asyncio.run(
                 h200.download_recording(
-                    creds,
-                    hub,
-                    camera,
+                    camera_client,
                     start_time,
                     end_time,
                     output,

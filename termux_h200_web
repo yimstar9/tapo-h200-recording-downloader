@@ -78,12 +78,12 @@ ensure_python_environment() {
     "$system_python" -m venv --upgrade --system-site-packages "$ROOT/.venv"
   fi
 
-  if ! "$PYTHON" -c "import pytapo" >/dev/null 2>&1; then
+  if ! "$PYTHON" -c "import aiofiles, pytapo" >/dev/null 2>&1; then
     echo "Installing Python requirements..."
     "$PYTHON" -m pip install -r "$ROOT/requirements.txt"
   fi
 
-  if ! "$PYTHON" -c "import cryptography, pytapo" >/dev/null 2>&1; then
+  if ! "$PYTHON" -c "import aiofiles, cryptography, pytapo" >/dev/null 2>&1; then
     echo "Python dependency verification failed." >&2
     exit 1
   fi

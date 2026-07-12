@@ -11,6 +11,7 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import warnings
 import uuid
 from dataclasses import dataclass
@@ -21,6 +22,8 @@ from typing import Any
 from cryptography.fernet import Fernet, InvalidToken
 from pytapo import Tapo
 from pytapo.const import CONNECTION_TIMEOUT
+from pytapo.media_stream.downloader import Downloader
+from pytapo.media_stream.convert import Convert
 from pytapo.media_stream._utils import (
     generate_nonce,
     parse_http_headers,
@@ -239,6 +242,46 @@ async def h200_media_start(self: HttpMediaSession) -> None:
 
 
 HttpMediaSession.start = h200_media_start
+
+
+def h200_calculate_media_length(self: Convert) -> float | bool:
+    tmp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp_name = tmp.name
+            tmp.write(self.writer.getvalue())
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "fatal",
+                "-f",
+                "mpegts",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                tmp_name,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        value = result.stdout.strip()
+        if result.returncode != 0 or not value:
+            return False
+        duration = float(value)
+        self.known_lengths[self.addedChunks] = duration
+        self.lengthLastCalculatedAtChunk = self.addedChunks
+        return duration
+    except (OSError, ValueError):
+        return False
+    finally:
+        if tmp_name is not None:
+            Path(tmp_name).unlink(missing_ok=True)
+
+
+Convert.calculateLength = h200_calculate_media_length
 
 
 @dataclass
@@ -510,6 +553,18 @@ def connect_hub(creds: Credentials) -> Tapo:
     return Tapo(creds.host, creds.user, creds.password, creds.cloud_password)
 
 
+def connect_camera(creds: Credentials, camera: dict[str, Any]) -> Tapo:
+    camera_client = Tapo(
+        creds.host,
+        creds.user,
+        creds.password,
+        creds.cloud_password,
+        childID=camera["device_id"],
+    )
+    camera_client.getUserID()
+    return camera_client
+
+
 def can_connect(host: str, port: int, timeout: float = 2.0) -> tuple[bool, str | None]:
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -739,230 +794,8 @@ def list_recordings(
     return sorted(clips, key=lambda item: int(item.get("startTime", 0)))
 
 
-def extract_private_alaw_audio(ts_path: Path, raw_path: Path) -> bool:
-    def payload_from_packet(packet: bytes) -> bytes:
-        adaptation_field_control = (packet[3] >> 4) & 0x03
-        offset = 4
-        if adaptation_field_control in (2, 3):
-            offset += 1 + packet[4]
-        if adaptation_field_control not in (1, 3) or offset >= len(packet):
-            return b""
-        return packet[offset:]
-
-    def write_pes_audio(pes: bytearray, handle: Any) -> int:
-        if len(pes) < 14 or pes[:3] != b"\x00\x00\x01":
-            return 0
-        stream_id = pes[3]
-        if not 0xC0 <= stream_id <= 0xDF:
-            return 0
-        pes_length = int.from_bytes(pes[4:6], "big")
-        header_length = pes[8]
-        data_start = 9 + header_length
-        data_end = 6 + pes_length if pes_length else len(pes)
-        data = bytes(pes[data_start:data_end])
-        if not data:
-            return 0
-        handle.write(data)
-        return len(data)
-
-    raw_path.parent.mkdir(parents=True, exist_ok=True)
-    current: dict[int, bytearray] = {}
-    bytes_written = 0
-    with ts_path.open("rb") as source, raw_path.open("wb") as audio:
-        while True:
-            packet = source.read(188)
-            if not packet:
-                break
-            if len(packet) != 188 or packet[0] != 0x47:
-                continue
-            pid = ((packet[1] & 0x1F) << 8) | packet[2]
-            payload_unit_start = bool(packet[1] & 0x40)
-            payload = payload_from_packet(packet)
-            if not payload:
-                continue
-            if payload_unit_start:
-                previous = current.pop(pid, None)
-                if previous is not None:
-                    bytes_written += write_pes_audio(previous, audio)
-                current[pid] = bytearray(payload)
-            elif pid in current:
-                current[pid].extend(payload)
-
-        for pes in current.values():
-            bytes_written += write_pes_audio(pes, audio)
-
-    if bytes_written == 0:
-        raw_path.unlink(missing_ok=True)
-        return False
-
-    print(f"Extracted {bytes_written // 1024} KiB A-law audio: {raw_path}")
-    return True
-
-
-def remux_ts_to_mp4(ts_path: Path, mp4_path: Path) -> bool:
-    mp4_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = mp4_path.with_suffix(".tmp.mp4")
-    audio_path = mp4_path.with_suffix(".alaw")
-    has_audio = extract_private_alaw_audio(ts_path, audio_path)
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-i",
-        str(ts_path),
-    ]
-    if has_audio:
-        cmd.extend([
-            "-f",
-            "alaw",
-            "-ar",
-            "8000",
-            "-ac",
-            "1",
-            "-i",
-            str(audio_path),
-        ])
-    cmd.extend([
-        "-map",
-        "0:v:0",
-    ])
-    if has_audio:
-        cmd.extend([
-            "-map",
-            "1:a:0",
-        ])
-    cmd.extend([
-        "-c:v",
-        "copy",
-    ])
-    if has_audio:
-        cmd.extend([
-            "-c:a",
-            "aac",
-            "-b:a",
-            "64k",
-            "-shortest",
-        ])
-    else:
-        cmd.append("-an")
-    cmd.extend([
-        "-movflags",
-        "+faststart",
-        str(tmp_path),
-    ])
-    try:
-        subprocess.run(cmd, check=True)
-    except (OSError, subprocess.CalledProcessError) as err:
-        print(f"MP4 remux failed: {err}")
-        tmp_path.unlink(missing_ok=True)
-        audio_path.unlink(missing_ok=True)
-        return False
-    finally:
-        audio_path.unlink(missing_ok=True)
-    tmp_path.replace(mp4_path)
-    return mp4_path.exists() and mp4_path.stat().st_size > 0
-
-
-async def download_recording_ts(
-    creds: Credentials,
-    hub: Tapo,
-    camera: dict[str, Any],
-    start_time: int,
-    end_time: int,
-    output: Path,
-    window_size: int,
-    stall_timeout: float,
-) -> bool:
-    player_id = uuid.uuid4().hex.upper()
-    query_params = {
-        "camera_mac": camera["mac"],
-        "type": "download",
-        "playerId": player_id,
-        "media_type": 0,
-    }
-    payload = {
-        "type": "request",
-        "seq": 1,
-        "params": {
-            "method": "get",
-            "download": {
-                "audio_config": {"encode_type": "OPUS", "sample_rate": "16"},
-                "dev_id": camera["device_id"],
-                "mac": camera["mac"],
-                "channels": [0],
-                "client_id": 1,
-                "end_time": str(end_time),
-                "event_type": [],
-                "media_type": 0,
-                "player_id": player_id,
-                "start_time": str(start_time),
-            },
-        },
-    }
-
-    session = HttpMediaSession(
-        ip=creds.host,
-        cloud_password=creds.cloud_password,
-        super_secret_key=hub.superSecretKey,
-        encryptionMethod=hub.getEncryptionMethod(),
-        port=8800,
-        username=creds.user,
-        query_params=query_params,
-        window_size=window_size,
-    )
-
-    output.parent.mkdir(parents=True, exist_ok=True)
-    chunks = 0
-    bytes_written = 0
-    with output.open("wb") as handle:
-        async with session as media:
-            stream = media.transceive(json.dumps(payload, separators=(",", ":")))
-            while True:
-                try:
-                    response = await asyncio.wait_for(
-                        stream.__anext__(),
-                        timeout=stall_timeout,
-                    )
-                except StopAsyncIteration:
-                    break
-                except asyncio.TimeoutError:
-                    print(f"Download stalled for {stall_timeout}s; stopping.")
-                    break
-
-                if response.mimetype == "application/json":
-                    try:
-                        body = json.loads(response.plaintext.decode())
-                    except json.JSONDecodeError:
-                        continue
-                    params = body.get("params", {})
-                    if body.get("type") == "response" and params.get("error_code", 0) != 0:
-                        print(json.dumps(body, ensure_ascii=False, indent=2))
-                        return False
-                    if (
-                        body.get("type") == "notification"
-                        and params.get("event_type") == "stream_status"
-                        and params.get("status") == "finished"
-                    ):
-                        break
-                elif response.mimetype == "video/mp2t":
-                    handle.write(response.plaintext)
-                    chunks += 1
-                    bytes_written += len(response.plaintext)
-
-    if chunks == 0:
-        output.unlink(missing_ok=True)
-        return False
-
-    print(f"Wrote {bytes_written // 1024} KiB in {chunks} chunks: {output}")
-    return True
-
-
 async def download_recording(
-    creds: Credentials,
-    hub: Tapo,
-    camera: dict[str, Any],
+    camera_client: Tapo,
     start_time: int,
     end_time: int,
     output: Path,
@@ -971,39 +804,74 @@ async def download_recording(
     output_format: str = "mp4",
     keep_ts: bool = False,
 ) -> bool:
-    if output_format == "ts":
-        return await download_recording_ts(
-            creds,
-            hub,
-            camera,
-            start_time,
-            end_time,
-            output.with_suffix(".ts"),
-            window_size,
-            stall_timeout,
-        )
+    final_output = output.with_suffix(f".{output_format}")
+    mp4_output = (
+        final_output
+        if output_format == "mp4"
+        else final_output.with_suffix(".download.mp4")
+    )
+    mp4_output.parent.mkdir(parents=True, exist_ok=True)
+    mp4_output.unlink(missing_ok=True)
 
-    mp4_output = output.with_suffix(".mp4")
-    ts_output = mp4_output.with_suffix(".download.ts")
-    ok = await download_recording_ts(
-        creds,
-        hub,
-        camera,
+    downloader = Downloader(
+        camera_client,
         start_time,
         end_time,
-        ts_output,
-        window_size,
-        stall_timeout,
+        0,
+        outputDirectory=str(mp4_output.parent) + os.sep,
+        fileName=mp4_output.name,
+        padding=0,
+        overwriteFiles=True,
+        window_size=window_size,
+        stall_timeout=stall_timeout,
     )
-    if not ok:
+    await downloader.downloadFile()
+    if not mp4_output.exists() or mp4_output.stat().st_size == 0:
+        mp4_output.unlink(missing_ok=True)
         return False
 
-    ok = remux_ts_to_mp4(ts_output, mp4_output)
-    if ok:
-        print(f"Remuxed MP4: {mp4_output}")
-        if not keep_ts:
-            ts_output.unlink(missing_ok=True)
-    return ok
+    if output_format == "ts":
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(mp4_output),
+            "-c",
+            "copy",
+            str(final_output),
+        ]
+        try:
+            subprocess.run(cmd, check=True)
+        except (OSError, subprocess.CalledProcessError) as err:
+            print(f"TS remux failed: {err}")
+            final_output.unlink(missing_ok=True)
+            return False
+        finally:
+            mp4_output.unlink(missing_ok=True)
+    elif keep_ts:
+        ts_output = mp4_output.with_suffix(".download.ts")
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(mp4_output),
+            "-c",
+            "copy",
+            str(ts_output),
+        ]
+        try:
+            subprocess.run(cmd, check=True)
+        except (OSError, subprocess.CalledProcessError) as err:
+            print(f"Keeping TS copy failed: {err}")
+
+    print(f"Saved {output_format.upper()}: {final_output}")
+    return final_output.exists() and final_output.stat().st_size > 0
 
 
 def print_children(cameras: list[dict[str, Any]]) -> None:
@@ -1294,6 +1162,7 @@ def main() -> int:
         ok_count = 0
         skip_count = 0
         fail_count = 0
+        camera_client = connect_camera(creds, camera)
         print(f"Found {len(clips)} clip(s).")
         for idx, clip in enumerate(clips):
             start_time = int(clip["startTime"])
@@ -1310,9 +1179,7 @@ def main() -> int:
             )
             ok = asyncio.run(
                 download_recording(
-                    creds,
-                    hub,
-                    camera,
+                    camera_client,
                     start_time,
                     end_time,
                     output,
@@ -1338,6 +1205,7 @@ def main() -> int:
             return 2
 
         clip = clips[args.download_index]
+        camera_client = connect_camera(creds, camera)
         start_time = int(clip["startTime"])
         end_time = int(clip["endTime"])
         output = output_path_for_clip(args.output_dir, camera, start_time, args.format)
@@ -1346,9 +1214,7 @@ def main() -> int:
             return 0
         ok = asyncio.run(
             download_recording(
-                creds,
-                hub,
-                camera,
+                camera_client,
                 start_time,
                 end_time,
                 output,

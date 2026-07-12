@@ -1,1 +1,2 @@
 pytapo==3.4.18
+aiofiles==25.1.0

@@ -1062,14 +1062,29 @@ def run_first_setup(args: argparse.Namespace) -> int:
             return 1
 
     creds = prompt_credentials(args)
-    save_config(config_path, key_path, creds)
 
     print()
     print(f"Connecting to H200 at {creds.host} as {creds.user}...")
-    hub = connect_hub(creds)
-    cameras = list_paired_cameras(hub)
+    try:
+        hub = connect_hub(creds)
+        cameras = list_paired_cameras(hub)
+    except Exception as err:
+        if "Invalid authentication data" in str(err):
+            print(
+                "인증에 실패했습니다. H200/camera account 비밀번호 또는 "
+                "Tapo cloud 비밀번호가 올바르지 않습니다.",
+                file=sys.stderr,
+            )
+            print("환경설정 파일은 변경하지 않았습니다.", file=sys.stderr)
+            return 2
+
+        print(f"H200 API 요청에 실패했습니다: {err}", file=sys.stderr)
+        print("환경설정 파일은 변경하지 않았습니다.", file=sys.stderr)
+        return 1
+
     if not cameras:
         print("No paired cameras returned by H200.")
+        print("환경설정 파일은 변경하지 않았습니다.")
         return 1
 
     print()
@@ -1084,6 +1099,7 @@ def run_first_setup(args: argparse.Namespace) -> int:
         f"device_id={camera.get('device_id')} "
         f"mac={camera.get('mac')}"
     )
+    save_config(config_path, key_path, creds)
     save_local_env(creds, config_path, key_path, camera)
     print_go2rtc_hint(creds, camera)
     print()

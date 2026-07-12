@@ -232,6 +232,8 @@ python -m venv .venv
 .venv/bin/python h200_recordings.py --setup
 ```
 
+인증 또는 D230 조회에 실패하면 기존 `.env`, `tapo_h200.local.json`, `tapo_h200.local.key`를 변경하지 않습니다.
+
 Termux 전용 관리 스크립트는 서버 실행 중 CPU가 잠들지 않도록 wake lock을 사용하고 PID와 로그를 프로젝트 폴더에 저장합니다.
 
 ```bash

@@ -35,6 +35,14 @@ class AppState:
     jobs: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class ClipDownloadRequest:
+    date: str
+    start_time: int
+    end_time: int
+    skip_existing: bool
+
+
 STATE: AppState
 
 
@@ -211,6 +219,67 @@ def run_download_job(job_id: str, date: str, skip_existing: bool) -> None:
                 else:
                     STATE.jobs[job_id]["failed"] += 1
         update(status="done", message="Done")
+    except Exception as err:
+        update(status="error", message=str(err))
+
+
+def run_download_clip_job(job_id: str, request: ClipDownloadRequest) -> None:
+    def update(**kwargs: Any) -> None:
+        with STATE.lock:
+            STATE.jobs[job_id].update(kwargs)
+
+    try:
+        update(status="running", message="Connecting to H200...")
+        creds, hub, camera = get_hub_and_camera()
+        clips = h200.list_recordings(hub, camera, request.date, request.date)
+        clip = next(
+            (
+                item
+                for item in clips
+                if int(item["startTime"]) == request.start_time
+                and int(item["endTime"]) == request.end_time
+            ),
+            None,
+        )
+        if clip is None:
+            raise RuntimeError("Selected recording is no longer available")
+
+        output = h200.output_path_for_clip(
+            str(MEDIA_DIR),
+            camera,
+            request.start_time,
+            "mp4",
+        )
+        update(total=1, downloaded=0, skipped=0, failed=0)
+        if h200.should_skip_output(output, request.skip_existing):
+            update(
+                current=1,
+                skipped=1,
+                status="done",
+                message=f"Skipped {output.name}",
+            )
+            return
+
+        camera_client = h200.connect_camera(creds, camera)
+        update(current=1, message=f"Downloading {output.name}")
+        ok = asyncio.run(
+            h200.download_recording(
+                camera_client,
+                request.start_time,
+                request.end_time,
+                output,
+                window_size=50,
+                stall_timeout=10.0,
+                output_format="mp4",
+                keep_ts=False,
+            )
+        )
+        update(
+            downloaded=1 if ok else 0,
+            failed=0 if ok else 1,
+            status="done",
+            message="Done" if ok else "Download failed",
+        )
     except Exception as err:
         update(status="error", message=str(err))
 
@@ -478,7 +547,7 @@ INDEX_HTML = r"""<!doctype html>
       </div>
       <div class="controls">
         <button class="cmd" id="refreshBtn">새로고침</button>
-        <button class="cmd primary" id="downloadBtn">다운로드</button>
+        <button class="cmd primary" id="downloadBtn">전체 다운로드</button>
       </div>
     </aside>
     <main>
@@ -490,7 +559,7 @@ INDEX_HTML = r"""<!doctype html>
         <section class="player">
           <video id="video" controls playsinline preload="auto"></video>
           <div class="playerActions" id="playerActions" hidden>
-            <a class="cmd primary" id="deviceDownloadLink" href="#">기기에 다운로드</a>
+            <a class="cmd primary" id="deviceDownloadLink" href="#" hidden>내 기기로 다운로드</a>
           </div>
           <div class="meta" id="meta"></div>
         </section>
@@ -510,6 +579,8 @@ INDEX_HTML = r"""<!doctype html>
     let selected = fmtDate(new Date());
     let clips = [];
     let activeFile = "";
+    let selectedClip = null;
+    let downloadJobActive = false;
     let jobTimer = null;
     let activeObjectUrl = "";
     let playLoadId = 0;
@@ -555,6 +626,8 @@ INDEX_HTML = r"""<!doctype html>
     function renderClips() {
       dateTitle.textContent = selected;
       clipList.innerHTML = "";
+      playerActions.hidden = true;
+      deviceDownloadLink.hidden = true;
       if (!clips.length) {
         clearVideoObjectUrl();
         playerActions.hidden = true;
@@ -608,6 +681,7 @@ INDEX_HTML = r"""<!doctype html>
         if (!res.ok) throw new Error(data.error || "목록 조회 실패");
         clips = data.clips || [];
         activeFile = "";
+        selectedClip = null;
         renderClips();
         setStatus(`${clips.length}개`);
       } catch (err) {
@@ -637,6 +711,32 @@ INDEX_HTML = r"""<!doctype html>
       }
     }
 
+    async function downloadSelected() {
+      if (!selectedClip || selectedClip.downloaded || downloadJobActive) return;
+      downloadJobActive = true;
+      setBusy(true);
+      setStatus("H200 영상 다운로드 시작");
+      try {
+        const res = await fetch("/api/download_clip", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            date: selected,
+            startTime: selectedClip.startTime,
+            endTime: selectedClip.endTime,
+            skipExisting: true
+          })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "선택 영상 다운로드 시작 실패");
+        pollJob(data.jobId);
+      } catch (err) {
+        downloadJobActive = false;
+        setStatus(err.message);
+        setBusy(false);
+      }
+    }
+
     async function pollJob(jobId) {
       clearTimeout(jobTimer);
       const res = await fetch(`/api/job?id=${jobId}`);
@@ -644,11 +744,13 @@ INDEX_HTML = r"""<!doctype html>
       const total = job.total || 0;
       setStatus(`${job.message || job.status} · ${job.current || 0}/${total} · 저장 ${job.downloaded || 0} · 건너뜀 ${job.skipped || 0}`);
       if (job.status === "done") {
+        downloadJobActive = false;
         setBusy(false);
         await loadDate();
         return;
       }
       if (job.status === "error") {
+        downloadJobActive = false;
         setBusy(false);
         return;
       }
@@ -656,18 +758,24 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     async function playClip(clip) {
-      activeFile = clip.filename;
-      renderClips();
-      if (!clip.downloaded) {
-        setStatus("먼저 다운로드 필요");
+      if (downloadJobActive) {
+        setStatus("다른 영상 다운로드 중");
         return;
       }
+      activeFile = clip.filename;
+      selectedClip = clip;
+      renderClips();
+      if (!clip.downloaded) {
+        downloadSelected();
+        return;
+      }
+      deviceDownloadLink.hidden = false;
+      playerActions.hidden = false;
       const loadId = ++playLoadId;
       meta.textContent = `${clip.localTime} · ${clip.duration}s · ${formatBytes(clip.size)}`;
       const downloadName = clip.filename.split("/").pop();
       deviceDownloadLink.href = `${clip.playUrl}?download=1`;
       deviceDownloadLink.download = downloadName;
-      playerActions.hidden = false;
       video.oncanplay = () => setStatus("재생 가능");
       video.onwaiting = () => setStatus("버퍼링 중");
       video.onplaying = () => setStatus("재생 중");
@@ -847,6 +955,40 @@ class Handler(BaseHTTPRequestHandler):
                 thread = threading.Thread(
                     target=run_download_job,
                     args=(job_id, date, skip_existing),
+                    daemon=True,
+                )
+                thread.start()
+                self.send_json({"jobId": job_id})
+            elif parsed.path == "/api/download_clip":
+                payload = self.read_json()
+                date = parse_date(payload.get("date"))
+                start_time = int(payload["startTime"])
+                end_time = int(payload["endTime"])
+                if start_time < 0 or end_time <= start_time:
+                    raise ValueError("Invalid recording time range")
+                request = ClipDownloadRequest(
+                    date=date,
+                    start_time=start_time,
+                    end_time=end_time,
+                    skip_existing=bool(payload.get("skipExisting", True)),
+                )
+                job_id = uuid.uuid4().hex
+                with STATE.lock:
+                    STATE.jobs[job_id] = {
+                        "id": job_id,
+                        "status": "queued",
+                        "message": "Queued",
+                        "date": date_for_input(date),
+                        "total": 1,
+                        "current": 0,
+                        "downloaded": 0,
+                        "skipped": 0,
+                        "failed": 0,
+                        "createdAt": time.time(),
+                    }
+                thread = threading.Thread(
+                    target=run_download_clip_job,
+                    args=(job_id, request),
                     daemon=True,
                 )
                 thread.start()
